@@ -1,0 +1,460 @@
+ABSOLUTE DEFINITION OF DONE (all must be true)
+----------------------------------------------
+[ ] Every endpoint in openapi.yaml exists with the exact path, method,
+    parameter names, response field names, and status codes.
+[ ] No input of any kind produces a 500.
+[ ] All five explain targets show IXSCAN and no COLLSCAN on ~100k logs.
+[ ] Concurrent creates, punch-ins, punch-outs, and PATCHes behave exactly as
+    specified (one winner, the rest 409; no lost history).
+[ ] All analytics are MongoDB aggregations reading stored derived values.
+[ ] All instants in and out are integer epoch milliseconds, including inside
+    history; no _id or artificial id ever appears in a response.
+[ ] REVIEW.md lists more than ten concrete starter defects.
+[ ] DECISIONS.md answers all five questions in ~150-200 words.
+[ ] The app starts from a clean clone and /health returns 200 within 20 s.
+[ ] Treatment of records dated before joined_on is decided and documented.
+
+SET 1 — ENVIRONMENT, CONFIGURATION, AND DATA PREPARATION
+---------------------------------------------------------
+[ ] Create a virtual environment and install requirements.txt.
+[ ] Run MongoDB 6.0+; the grader uses MongoDB 7.0.
+[ ] Support native MongoDB, Docker, or MongoDB Atlas M0 for local setup
+    (a Dockerfile must NOT be committed).
+[ ] Create a local .env containing MONGO_URI and MONGO_DB, but never commit it.
+    The kit's README mentions .env.example but the kit does not contain one: if
+    it is absent, create only a local .env.
+[ ] Ensure real environment variables override .env values using
+    load_dotenv(override=False). Never hard-code connection details.
+[ ] Run sample_seed.py to load the sample employees and attendance documents.
+[ ] Use MongoClient with tz_aware=True.
+[ ] Ensure the service starts from the repository root with:
+    uvicorn app.main:app --port 8000
+[ ] Ensure /health is ready within 20 seconds against a pre-seeded database.
+[ ] Do not call any external service other than MongoDB.
+[ ] Build additional test data for:
+    - employees with no logs;
+    - tied late-minute totals (including a tie at the leaderboard cutoff);
+    - weekend records;
+    - mid-month joiners;
+    - overnight-shift employees;
+    - missing weekdays with no record at all (distinct from ABSENT records);
+    - legacy documents missing history, half_day, late_minutes,
+      overtime_minutes, or work_hours;
+    - orphan logs whose emp_code has no employee;
+    - records dated before joined_on;
+    - approximately 100,000 attendance logs for performance testing.
+
+SET 2 — FOUNDATION, VALIDATION, TIME, AND ROUNDING
+--------------------------------------------------
+[ ] Add helpers for epoch milliseconds to UTC datetime and back.
+[ ] Treat all API instants as integer epoch milliseconds.
+[ ] Store instants as BSON UTC datetimes; treat any naive datetime read from
+    MongoDB as UTC.
+[ ] Strictly validate timestamps:
+    - reject floats;
+    - reject strings;
+    - reject booleans;
+    - reject values below 100000000000;
+    - reject values above 4102444800000;
+    - return 422 for invalid values.
+[ ] Use strict Pydantic integer validation; bool must not be accepted as an integer.
+[ ] Do not use truthiness checks on punched_at (0 must not silently mean "now").
+[ ] Truncate all instants to whole seconds before calculations, storage, and responses.
+[ ] Validate query bounds:
+    - page >= 1;
+    - page_size between 1 and 100 (default 20);
+    - leaderboard limit between 1 and 50 (default 10).
+[ ] Add shared validators for employee code, email, field lengths, shifts,
+    statuses, months, and dates.
+[ ] Validate emp_code using ^EMP\d{4,6}$.
+[ ] Validate email using ^[^@\s]+@[^@\s]+\.[^@\s]+$ with max length 120.
+[ ] Validate field lengths: name 1-100, department 1-50.
+[ ] Validate shifts using ^([01]\d|2[0-3]):[0-5]\d$ (defaults 09:30 / 18:30).
+[ ] Validate month using ^\d{4}-(0[1-9]|1[0-2])$.
+[ ] Reject invalid calendar dates such as 2026-02-30 with 422 rather than 500.
+[ ] Treat dates as YYYY-MM-DD strings.
+[ ] Treat months as YYYY-MM strings.
+[ ] Treat shift times as HH:MM IST strings.
+[ ] Use Decimal half-up rounding for work hours and reported analytics numbers.
+[ ] Do not rely on Python round() or MongoDB $round for final reported values.
+[ ] Round work_hours, attendance_pct, avg_work_hours, attendance_rate, and
+    moving_avg_7d in Python with Decimal half-up (2 decimals; rates and moving
+    averages 4 decimals).
+[ ] Implement R1 attendance-date logic in IST, including overnight shifts
+    (punch-in earlier than shift_end belongs to the previous day's shift; the
+    shift end falls on the next calendar day).
+[ ] Implement R2 late-minute logic in IST, grace 10 minutes, measured from
+    shift_start (floor), late only if strictly more than 10:00 after start:
+    - 09:40:00 for a 09:30 shift -> 0;
+    - 09:40:01 -> 10;
+    - 10:15:59 -> 45.
+[ ] Implement R3 overtime logic: floor minutes from shift_end to punch_out,
+    counted only if >= 30, else 0; overnight shift_end is on the next day.
+[ ] Implement R4 work-hours calculation: seconds/3600, half-up to 2 decimals.
+[ ] Implement R5 half-day calculation: true when ROUNDED work_hours < 4.50.
+[ ] Implement R6 presence: PRESENT, WFH, ON_DUTY present; ABSENT, LEAVE not.
+[ ] Return consistent errors in FastAPI's default {"detail": ...} body:
+    404 missing resources, 409 conflicts, 422 validation failures, and no
+    avoidable 500 responses.
+[ ] Ignore client-supplied derived fields (work_hours, late_minutes,
+    overtime_minutes, half_day) rather than treating them as authoritative.
+
+SET 3 — DATABASE INDEXES, QUERY DESIGN, AND PERFORMANCE
+--------------------------------------------------------
+[ ] Create indexes at startup and make creation idempotent.
+[ ] Create a unique index on employees.emp_code.
+[ ] Create a unique compound index on attendance_logs (emp_code, date).
+[ ] Create an attendance index on (date -1, emp_code 1) for list sorting.
+[ ] Use that index for unfiltered list sorting and date-range scans.
+[ ] Create an index on attendance_logs (status 1, date -1, emp_code 1) for
+    status-filtered lists.
+[ ] Create an optional attendance index on (emp_code 1, punch_in -1) for
+    punch-out lookup.
+[ ] Create employees indexes on (department, joined_on).
+[ ] Create a separate employees index on joined_on for department-less
+    headcount matches.
+[ ] Wrap index creation so failures are logged clearly.
+[ ] Ensure index startup work does not prevent /health from becoming ready
+    within 20 seconds.
+[ ] Confirm restarting the application twice does not fail or duplicate indexes.
+[ ] Ensure list endpoints use MongoDB sort, skip, limit, and count operations.
+[ ] Never load an entire large collection into Python.
+[ ] Use indexed date-string ranges instead of regex month filters.
+[ ] Filter trend logs by department employee codes or indexed lookup.
+[ ] Use shared query-builder functions in both real endpoints and /admin/explain.
+[ ] Ensure large queries and aggregations are index-backed where required.
+[ ] Review and document at least one considered but rejected index in DECISIONS.md.
+[ ] Consider and document what would change for 100 times the data.
+
+SET 4 — PART A: REVIEW AND FIX THE STARTER CRUD
+-----------------------------------------------
+[ ] GET /health:
+    - ping MongoDB;
+    - return 200 {"status": "ok"} only when MongoDB responds;
+    - return 503 when MongoDB is unavailable.
+[ ] POST /employees:
+    - validate emp_code against ^EMP\d{4,6}$;
+    - validate email and field lengths;
+    - validate shift formats;
+    - validate joined_on as a real YYYY-MM-DD date;
+    - reject equal shift_start and shift_end;
+    - rely on the unique index rather than check-then-insert;
+    - catch DuplicateKeyError and return 409 (concurrent duplicates: one 201,
+      rest 409);
+    - store timezone-aware created_at set by the server;
+    - return created_at as epoch milliseconds;
+    - never expose _id.
+[ ] GET /employees:
+    - optional department filter, exact and CASE-SENSITIVE match;
+    - calculate skip as (page - 1) * page_size;
+    - calculate total using the department filter;
+    - sort by emp_code ascending;
+    - validate page and page_size;
+    - cap page_size at 100;
+    - return {items, total, page, page_size}.
+[ ] POST /attendance/punch-in:
+    - return 404 for an unknown employee;
+    - accept only PRESENT, WFH, and ON_DUTY; status defaults to PRESENT;
+    - punched_at defaults to now when omitted;
+    - validate punched_at strictly;
+    - calculate IST date with the overnight rule;
+    - truncate to whole seconds;
+    - compute late_minutes per R2;
+    - new record starts with punch_out null, work_hours null,
+      overtime_minutes 0, half_day false, history [];
+    - use the unique index for race-safe insertion (no check-then-insert);
+    - return 201 on success and 409 on duplicate attendance date;
+    - return no artificial id;
+    - return times as epoch milliseconds.
+[ ] GET /attendance:
+    - optional filters: emp_code, date_from, date_to (inclusive), status;
+    - perform sort, skip, and limit in MongoDB;
+    - sort date descending and emp_code ascending;
+    - calculate total with count_documents on the filtered query;
+    - reject date_from > date_to with 422;
+    - validate date formats and status values;
+    - default missing legacy history, half_day, and derived fields safely;
+    - convert datetimes to epoch milliseconds;
+    - drop _id;
+    - return {items, total, page, page_size}.
+[ ] Fix helper defects involving UTC versus IST, grace boundaries, banker's
+    rounding, the overtime minimum, overnight support, and naive/aware
+    datetime mixing. Decide explicitly whether each starter helper is reused
+    as-is (none should be) or rewritten.
+[ ] Write REVIEW.md with concrete failing examples, fixes, and items examined
+    and found correct.
+[ ] Explicitly note that load_dotenv does not override real environment
+    variables by default and is acceptable when used correctly.
+
+KNOWN STARTER DEFECTS TO FIND AND RECORD (from reading the starter main.py)
+[ ]  1. MongoClient created without tz_aware=True (naive datetimes everywhere).
+[ ]  2. /health never pings MongoDB; always returns 200.
+[ ]  3. create_employee uses check-then-insert (race) and has no unique index.
+[ ]  4. created_at uses naive local datetime.now() and is returned as a datetime,
+         not epoch milliseconds.
+[ ]  5. EmployeeIn has no validation (emp_code pattern, email, lengths, shift
+         format, shift_start == shift_end, joined_on date).
+[ ]  6. list_employees skip = page * page_size (should be (page - 1) * page_size).
+[ ]  7. list_employees total counts the whole collection, ignoring department.
+[ ]  8. list_employees has no sort; no page/page_size bounds.
+[ ]  9. punch_in crashes with TypeError (500) for an unknown employee instead of 404.
+[ ] 10. punch_in uses datetime.fromtimestamp (server-local, naive) and derives
+         the date in server time, not IST, with no overnight rule.
+[ ] 11. punch_in is check-then-insert (two concurrent requests can both pass).
+[ ] 12. punch_in does not validate status; truthiness check on punched_at;
+         no strict int/ms validation; no truncation to whole seconds.
+[ ] 13. punch_in response leaks an artificial "id" and returns raw datetimes.
+[ ] 14. compute_late_minutes uses the punch-in's own (UTC/naive) clock fields,
+         not IST, and floors before the > 10 check so 10:00:01 returns 0.
+[ ] 15. compute_work_hours uses float round() (banker's/binary rounding).
+[ ] 16. compute_overtime has no 30-minute minimum, no overnight handling,
+         and mixes aware and naive datetimes.
+[ ] 17. list_attendance loads the whole collection and sorts/paginates in Python.
+[ ] 18. list_attendance sorts by date only (no emp_code tie-break), total is
+         len(docs), no date/status/date-order validation.
+[ ] 19. list_attendance leaks _id as "id", returns raw datetimes, and does not
+         default missing legacy fields.
+[ ] 20. No indexes are created at startup.
+
+SET 5 — ATTENDANCE OPERATIONS AND REGULARIZATION
+------------------------------------------------
+[ ] POST /attendance/punch-out:
+    - find the latest record with punch_in <= punched_at;
+    - consider only records with non-null punch_in;
+    - return 404 if the employee does not exist or no qualifying punch-in exists;
+    - if the latest matching record is already punched out, return 409 rather
+      than falling back to an older record;
+    - truncate punched_at to whole seconds;
+    - default punched_at to now when omitted;
+    - calculate overnight shift end as record date plus one day at shift_end;
+    - reject punch-out <= punch_in with 422;
+    - reject punch-out more than 24 hours after punch-in with 422;
+    - atomically update using a filter requiring punch_out to be null;
+    - ensure simultaneous punch-outs produce one 200 and 409 for the rest;
+    - compute work_hours, overtime_minutes, and half_day;
+    - do not append history for a normal punch-out;
+    - return the full updated record.
+[ ] PATCH /attendance/{emp_code}/{date}:
+    - validate the request and ignore client-supplied derived values;
+    - reason 5-200 characters and regularized_by 1-50 characters, both required;
+    - return 404 for an unknown employee or missing record;
+    - allow changes only to status, punch_in, and punch_out;
+    - reject no-op requests with 422;
+    - for ABSENT or LEAVE, clear both punch times;
+    - reject supplied punch times when setting ABSENT or LEAVE;
+    - require punch_in for a presence status (supplied or already stored);
+    - when changing from ABSENT/LEAVE to presence, require punch_in in the
+      same request;
+    - ensure punch_in remains on the record's attendance date under R1;
+    - require punch_out after punch_in and within 24 hours;
+    - recompute all derived values (R2-R5) from the final times;
+    - reset ABSENT/LEAVE derived values to null, 0, 0, false;
+    - include changed derived resets in history changes;
+    - append exactly one history entry {at, by, reason, changes} per success;
+    - include only actually changed fields, each as {from, to};
+    - store nested punch times in history as epoch milliseconds at the API
+      boundary (BSON datetimes in MongoDB);
+    - preserve prior history entries (append only, never overwrite);
+    - support legacy records without history;
+    - use optimistic locking or an equivalent atomic update;
+    - return 409 for a losing concurrent edit when necessary.
+[ ] Ensure attendance records are addressed by emp_code and date, never by
+    exposed _id.
+[ ] Ensure normal punch-in and punch-out operations never write audit history.
+
+SET 6 — ANALYTICS AND BUSINESS REPORTING
+----------------------------------------
+GENERAL ANALYTICS RULES
+[ ] Implement all analytics as MongoDB aggregation pipelines.
+[ ] Do not fetch collections and loop over them in Python.
+[ ] Read stored derived values; never recompute analytics from punch times.
+[ ] Derive weekdays from the attendance date string, not UTC punch_in.
+[ ] Use $ifNull for missing half_day, late_minutes, overtime_minutes, history,
+    and work_hours.
+[ ] Present-day counts are Monday-Friday only.
+[ ] Late counts, total late minutes, and total overtime include weekend records.
+[ ] Average work hours has no weekday restriction and includes qualifying
+    weekend presence records.
+[ ] Trend present_count includes weekends.
+[ ] Ignore orphan logs in the leaderboard.
+[ ] Take department from employees, never from logs.
+[ ] Decide and document how records before joined_on are treated because the
+    specification does not define that case.
+
+EMPLOYEE MONTHLY — GET /analytics/employees/{emp_code}/monthly
+[ ] Required query param month (YYYY-MM); 404 for an unknown employee.
+[ ] Calculate working days Monday-Friday from max(joined_on, month start).
+[ ] Return zero working days and null attendance_pct when joined_on is after
+    month end.
+[ ] Count present_days with half days worth 0.5, presence statuses only,
+    weekdays only.
+[ ] Count leave_days (number of LEAVE records).
+[ ] Count late_count: records with late_minutes > 0.
+[ ] Sum stored late_minutes and overtime_minutes (total_late_minutes,
+    total_overtime_minutes), including weekend records.
+[ ] attendance_pct = present_days / working_days x 100, Decimal half-up,
+    2 decimals.
+[ ] Return null attendance_pct when working_days is zero.
+[ ] Response fields: emp_code, month, working_days, present_days, leave_days,
+    late_count, total_late_minutes, total_overtime_minutes, attendance_pct.
+
+DEPARTMENT SUMMARY — GET /analytics/departments/summary
+[ ] Required month; optional exact, case-sensitive department filter.
+[ ] Start from employees so zero-log employees count toward headcount.
+[ ] Count employees whose joined_on <= month end.
+[ ] Exclude employees who join after the month.
+[ ] Calculate present_days using weekday records and half-day values.
+[ ] avg_work_hours = mean work_hours over RECORDS (not an average of
+    per-employee averages) that have a presence status AND a non-null
+    work_hours value; Decimal half-up, 2 decimals.
+[ ] Include qualifying weekend presence records in avg_work_hours.
+[ ] Return null avg_work_hours when no qualifying values exist.
+[ ] Count late_count (late_minutes > 0), total_late_minutes, leave_count
+    (LEAVE records), and on_duty_count (ON_DUTY records).
+[ ] Sort departments ascending.
+[ ] Omit departments with zero headcount.
+[ ] Response fields: department, headcount, present_days, avg_work_hours,
+    late_count, total_late_minutes, leave_count, on_duty_count.
+
+LATE LEADERBOARD — GET /analytics/leaderboard/late
+[ ] Required month; optional department; optional limit (1-50, default 10).
+[ ] Group by employee and total stored late_minutes.
+[ ] Include only totals greater than zero.
+[ ] Ignore orphan logs.
+[ ] Join employee name and department from employees.
+[ ] Support optional department filtering and rank inside the selected
+    department only.
+[ ] Use $setWindowFields and standard competition ranking: 1, 2, 2, 4.
+[ ] Apply limit after ranking.
+[ ] Return every row with rank <= limit, even when ties exceed limit.
+[ ] Sort total_late_minutes descending, then emp_code ascending.
+[ ] Response fields: rank, emp_code, name, department, total_late_minutes,
+    late_count.
+
+DEPARTMENT TREND — GET /analytics/departments/{department}/trend
+[ ] Required query params from and to (YYYY-MM-DD).
+[ ] Return 404 for an unknown department (no employees).
+[ ] Return 422 when to < from or the range exceeds 92 days.
+[ ] Return exactly one row per calendar day, from through to inclusive.
+[ ] Include weekends and days with no records.
+[ ] Use MongoDB gap filling, such as $densify, rather than a Python loop.
+[ ] Calculate is_working_day (Mon-Fri) and headcount from department employees
+    whose joined_on <= that day.
+[ ] Filter logs by department employee codes or indexed lookup.
+[ ] Calculate present_count with half days worth 0.5, including weekends.
+[ ] Calculate late_count (late_minutes > 0).
+[ ] Calculate attendance_rate = present_count / headcount only on working days
+    with positive headcount.
+[ ] Return 0.0 for an empty working day with positive headcount.
+[ ] Return null on weekends or when headcount is zero.
+[ ] Calculate moving_avg_7d from the current row and up to six preceding rows
+    inside the requested range (rows before from are not considered).
+[ ] Ignore null rates and return null when no non-null values exist.
+[ ] Round rates and moving averages to four decimals with Decimal half-up.
+[ ] Response fields per row: date, is_working_day, headcount, present_count,
+    late_count, attendance_rate, moving_avg_7d.
+
+SET 7 — EXPLAINABILITY, TESTING, AND QUALITY PROOF
+--------------------------------------------------
+EXPLAIN ENDPOINT — GET /admin/explain/{endpoint}
+[ ] Support attendance_list, employee_monthly, department_summary,
+    late_leaderboard, and department_trend.
+[ ] Accept the same query parameters as the endpoint being explained:
+    - attendance_list: emp_code, date_from, date_to, status, page, page_size;
+    - employee_monthly: emp_code, month;
+    - department_summary: month, optional department;
+    - late_leaderboard: month, optional limit, optional department;
+    - department_trend: department, from, to.
+[ ] Build the exact same query or pipeline as the real endpoint, including
+    filters, sort, and pagination.
+[ ] Use shared query builders.
+[ ] Use executionStats verbosity.
+[ ] For aggregations, explain the aggregate operation with MongoDB's explain
+    command.
+[ ] Ensure every collection touched by a pipeline is index-backed.
+[ ] Make ObjectId and datetime values JSON-safe.
+[ ] Scan nested explain output for COLLSCAN, not only top-level stages.
+[ ] Return 422 for unknown endpoint names.
+[ ] Return 422 when required parameters are missing.
+[ ] Return {endpoint, collection, explain}.
+[ ] Verify all five targets show IXSCAN and no COLLSCAN on approximately
+    100,000 documents.
+
+EDGE-CASE AND CONCURRENCY TESTS
+[ ] Test late boundaries: 09:40:00 -> 0, 09:40:01 -> 10, 10:15:59 -> 45.
+[ ] Test overtime at 29 versus 30 minutes.
+[ ] Test work-hour .xx5 cases for half-up rounding.
+[ ] Test half-day at 4.49 versus 4.50 hours.
+[ ] Test overnight punch-in and punch-out across midnight.
+[ ] Test concurrent employee creates.
+[ ] Test concurrent punch-ins.
+[ ] Test concurrent punch-outs.
+[ ] Test concurrent PATCH requests and history preservation.
+[ ] Test timestamps in seconds, floats, strings, and booleans; all must be 422.
+[ ] Test page_size=101, page=0, limit=0, and limit=51; all must be 422.
+[ ] Test invalid months such as 2026-13 and 2026-1.
+[ ] Test invalid dates such as 2026-02-30.
+[ ] Test that derived fields sent in request bodies are ignored.
+[ ] Test legacy documents with missing fields in list and analytics endpoints.
+[ ] Test orphan logs are ignored in the leaderboard.
+[ ] Test weekend records affect late/overtime but not weekday present_days.
+[ ] Test records dated before joined_on follow the documented decision.
+[ ] Test department filter is case-sensitive on employees, summary, leaderboard.
+[ ] Test punch-in defaults (status PRESENT, punched_at now) and initial values.
+[ ] Test no bad input results in an avoidable 500.
+[ ] Test /health readiness within 20 seconds and 503 when MongoDB is down.
+[ ] Test idempotent index creation across restarts.
+[ ] Test all response timestamps, including history values, are epoch ms.
+[ ] Test no internal MongoDB identifiers leak through responses.
+
+SET 8 — DOCUMENTATION, SUBMISSION, AND LIVE WALKTHROUGH
+--------------------------------------------------------
+[ ] Fill REVIEW.md with more than ten concrete starter defects.
+[ ] For every defect, record its location, failure, detection method, and fix.
+[ ] Record areas examined and found correct.
+[ ] Fill DECISIONS.md in approximately 150-200 words covering:
+    1. indexes created, their purposes, and one rejected index;
+    2. the exact concurrent punch-in race behavior;
+    3. leaderboard tie behavior at the limit cutoff;
+    4. how zero-log employees are included in headcount;
+    5. one change required for 100 times the data.
+[ ] Keep README.md concise and explain how to run the service.
+[ ] State any incomplete work clearly in README.md if the submission remains
+    partial (partial submissions are welcome).
+[ ] Include app/main.py, requirements.txt, REVIEW.md, DECISIONS.md, and README.md.
+[ ] Add a .gitignore covering .env, .venv, and __pycache__.
+[ ] Do not commit .env, secrets, Dockerfiles, virtual environments, or data dumps.
+[ ] Ensure requirements.txt includes every imported package.
+[ ] Use Python 3.11+.
+[ ] Test from a clean clone: install requirements and run uvicorn.
+[ ] Work alone; submissions are checked for similarity.
+[ ] Submit a public Git repository link by the stated deadline, in the way
+    described in the email.
+[ ] Prepare to explain every line (AI use is allowed, but you are responsible
+    for the code) and make a small live change.
+[ ] Prepare to explain the treatment of records dated before joined_on.
+
+EVALUATION WEIGHTS (for prioritising effort)
+--------------------------------------------
+Review (Part A) 10% | CRUD, rules, concurrency 30% | Analytics correctness 30%
+| MongoDB usage and speed 15% | Decisions and code quality 15%.
+
+SUGGESTED ORDER ACROSS THE 8 SETS
+---------------------------------
+1. Complete Set 1: environment, configuration, and test data.
+2. Complete Set 2: foundation, validators, time handling, and rounding.
+3. Complete Set 3: indexes, query builders, and performance design.
+4. Complete Set 4: fix and document the starter CRUD implementation.
+5. Complete Set 5: implement punch-out and regularization with concurrency safety.
+6. Complete Set 6: implement and validate all analytics pipelines.
+7. Complete Set 7: implement explain plans and run functional, edge-case,
+   concurrency, and performance tests.
+8. Complete Set 8: finish documentation, clean-clone verification,
+   submission, and live-walkthrough preparation.
+
+CURRENT STATUS / TARGET
+-----------------------
+The received kit is an incomplete starter. The target is a complete,
+contract-compliant, concurrency-safe, indexed, aggregation-backed, tested,
+documented, and submission-ready implementation that satisfies every item
+above.
