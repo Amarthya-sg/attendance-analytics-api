@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 
 load_dotenv()  # won't override variables that are already set in the environment
 
@@ -74,7 +74,7 @@ def ensure_indexes() -> None:
 async def lifespan(_: FastAPI):
     try:
         ensure_indexes()
-    except PyMongoError as exc:  # the app still starts, and /health returns 503 until Mongo answers
+    except PyMongoError as exc:  # the app still starts; /health retries until the indexes exist
         log.warning("index creation deferred: %s", exc)
     yield
 
@@ -255,12 +255,18 @@ def _check_date_param(name: str, value: Optional[str]) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    # 503 only when MongoDB itself is unreachable.
     try:
         client.admin.command("ping")
-        if not _indexes_ready:
-            ensure_indexes()
     except PyMongoError:
         raise HTTPException(503, "database unavailable")
+    if not _indexes_ready:
+        try:
+            ensure_indexes()
+        except ConnectionFailure:  # Mongo dropped between the ping and the index build
+            raise HTTPException(503, "database unavailable")
+        except PyMongoError as exc:  # e.g. a conflicting index; Mongo is up, so keep serving and log it
+            log.error("index creation failed: %s", exc)
     return {"status": "ok"}
 
 

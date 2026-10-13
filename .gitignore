@@ -1,4 +1,6 @@
 .env
 .venv/
 __pycache__/
-goals.txt
+*.txt
+goalsv2.txt
+digests.txt
