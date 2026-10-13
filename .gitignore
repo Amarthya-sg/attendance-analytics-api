@@ -2,5 +2,4 @@
 .venv/
 __pycache__/
 *.txt
-goalsv2.txt
-digests.txt
+datasetreq.txt
