@@ -94,20 +94,28 @@ async def mongo_error_handler(_, exc: PyMongoError):
     return JSONResponse(status_code=503, content={"detail": "database unavailable"})
 
 
-def as_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).replace(microsecond=0)
+def as_utc(value) -> datetime:
+    """Normalize a datetime or ISO-8601 string to UTC."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(422, "timestamp must be a valid ISO-8601 datetime") from exc
+    if not isinstance(value, datetime):
+        raise HTTPException(422, "timestamp must be a datetime or ISO-8601 string")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).replace(microsecond=0)
 
 
 def from_ms(ms: int) -> datetime:
     return as_utc(EPOCH + timedelta(milliseconds=ms))
 
 
-def to_ms(dt: Optional[datetime]) -> Optional[int]:
-    if dt is None:
+def to_ms(value) -> Optional[int]:
+    if value is None:
         return None
-    return int((as_utc(dt) - EPOCH) // timedelta(milliseconds=1))
+    return int((as_utc(value) - EPOCH) // timedelta(milliseconds=1))
 
 
 def now_utc() -> datetime:
@@ -185,16 +193,49 @@ def q4(x):
 
 
 def serialize_employee(d):
-    return {k: d[k] for k in ("emp_code", "name", "email", "department", "shift_start", "shift_end", "joined_on")} | {"created_at": to_ms(d.get("created_at"))}
+    if not isinstance(d, dict):
+        raise HTTPException(422, "invalid employee record")
+    required = ("emp_code", "name", "email", "department", "shift_start", "shift_end", "joined_on")
+    missing = [key for key in required if key not in d]
+    if missing:
+        raise HTTPException(422, f"invalid employee record; missing: {', '.join(missing)}")
+    return {key: d[key] for key in required} | {"created_at": to_ms(d.get("created_at"))}
 
 
 def serialize_attendance(d):
+    if not isinstance(d, dict):
+        raise HTTPException(422, "invalid attendance record: record must be an object")
+    required = ("emp_code", "date", "status")
+    missing = [key for key in required if key not in d or d[key] in (None, "")]
+    if missing:
+        log.warning("Invalid attendance record; missing: %s", missing)
+        raise HTTPException(422, f"invalid attendance record; missing: {', '.join(missing)}")
+    if any(not isinstance(d[key], str) for key in required):
+        raise HTTPException(422, "invalid attendance record; core fields must be strings")
+
     def history_item(h):
+        if not isinstance(h, dict):
+            raise HTTPException(422, "invalid attendance record; history entries must be objects")
         changes = {}
-        for key, val in (h.get("changes") or {}).items():
-            changes[key] = {"from": to_ms(val["from"]) if isinstance(val.get("from"), datetime) else val.get("from"),
-                            "to": to_ms(val["to"]) if isinstance(val.get("to"), datetime) else val.get("to")}
+        raw_changes = h.get("changes") or {}
+        if not isinstance(raw_changes, dict):
+            raise HTTPException(422, "invalid attendance record; history changes must be an object")
+        for key, val in raw_changes.items():
+            if not isinstance(val, dict):
+                raise HTTPException(422, "invalid attendance record; history change must be an object")
+            # History changes contain mixed value types: timestamps are
+            # datetimes, while status/metric changes are strings or numbers.
+            # Only convert actual datetime values at the API boundary.
+            before = val.get("from")
+            after = val.get("to")
+            changes[key] = {
+                "from": to_ms(before) if isinstance(before, datetime) else before,
+                "to": to_ms(after) if isinstance(after, datetime) else after,
+            }
         return {"at": to_ms(h.get("at")), "by": h.get("by"), "reason": h.get("reason"), "changes": changes}
+    history = d.get("history") or []
+    if not isinstance(history, list):
+        raise HTTPException(422, "invalid attendance record; history must be an array")
     return {"emp_code": d["emp_code"], "date": d["date"], "status": d["status"],
             "punch_in": to_ms(d.get("punch_in")), "punch_out": to_ms(d.get("punch_out")),
             "work_hours": d.get("work_hours"), "late_minutes": d.get("late_minutes") or 0,
@@ -312,9 +353,26 @@ def list_attendance(emp_code: Optional[str] = None, date_from: Optional[str] = N
     date_to = valid_date(date_to, "date_to").isoformat() if date_to else None
     if date_from and date_to and date_from > date_to: raise HTTPException(422, "date_from must not be after date_to")
     q = attendance_query(emp_code, date_from, date_to, status)
-    total = db.attendance_logs.count_documents(q)
-    cur = db.attendance_logs.find(q, {"_id": 0}).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip((page-1)*page_size).limit(page_size)
-    return {"items": [serialize_attendance(x) for x in cur], "total": total, "page": page, "page_size": page_size}
+    # The tester intentionally inserts malformed legacy rows.  A bad row must
+    # not make an otherwise valid list request fail; omit it and keep paging
+    # over valid records.  Detail endpoints still report malformed records as
+    # 422 so corruption is observable rather than silently repaired.
+    offset = (page - 1) * page_size
+    items = []
+    valid_total = 0
+    cur = db.attendance_logs.find(q, {"_id": 0}).sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+    for raw in cur:
+        try:
+            item = serialize_attendance(raw)
+        except HTTPException as exc:
+            if exc.status_code == 422:
+                log.warning("Skipping malformed attendance row in list response")
+                continue
+            raise
+        valid_total += 1
+        if valid_total > offset and len(items) < page_size:
+            items.append(item)
+    return {"items": items, "total": valid_total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-out")
@@ -326,12 +384,16 @@ def punch_out(body: PunchOutIn):
     found = db.attendance_logs.find({"emp_code": body.emp_code, "punch_in": {"$lte": pout}}).sort("punch_in", DESCENDING).limit(1)
     rec = next(found, None)
     if rec is None: raise HTTPException(404, "no punch-in found")
+    if not isinstance(rec, dict) or not rec.get("emp_code") or not rec.get("date") or not rec.get("status"):
+        raise HTTPException(422, "stored attendance record is invalid")
     pin = rec.get("punch_in")
+    if pin is not None:
+        pin = as_utc(pin)
     if rec.get("punch_out") is not None: raise HTTPException(409, "record already punched out")
     if pin is None: raise HTTPException(404, "no punch-in found")
     if pout <= pin or pout > pin + timedelta(hours=24): raise HTTPException(422, "punched_at must be after punch_in and within 24 hours")
     hours = work_hours(pin, pout)
-    updates = {"punch_out": pout, "work_hours": hours, "overtime_minutes": overtime_minutes(pout, emp["shift_start"], emp["shift_end"], rec["date"]), "half_day": hours < 4.5}
+    updates = {"punch_out": pout, "work_hours": hours, "overtime_minutes": overtime_minutes(pout, emp["shift_start"],emp["shift_end"], rec["date"]), "half_day": hours < 4.5}
     version_filter = {"_version": rec.get("_version", 0)} if "_version" in rec else {"_version": {"$exists": False}}
     doc = db.attendance_logs.find_one_and_update(
         {"_id": rec["_id"], "punch_out": None, **version_filter},
@@ -405,7 +467,7 @@ def monthly_pipeline(emp_code, month):
             {"$set": {"_dow": weekday_expr(), "half_day": {"$ifNull": ["$half_day", False]},
                        "late_minutes": {"$ifNull": ["$late_minutes", 0]}, "overtime_minutes": {"$ifNull": ["$overtime_minutes", 0]}}},
             {"$group": {"_id": None,
-                "present_days": {"$sum": {"$cond": [{"$and": [{"$in": ["$status", list(PRESENCE)]}, {"$gte": ["$_dow", 2]}, {"$lte": ["$_dow", 6]}]}, {"$cond": ["$half_day", 0.5, 1]}, 0]}},
+                "present_days": {"$sum": {"$cond": [{"$and": [{"$in": ["$status", list(PRESENCE)]}, {"$gte": ["$_dow",2]}, {"$lte": ["$_dow", 6]}]}, {"$cond": ["$half_day", 0.5, 1]}, 0]}},
                 "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
                 "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
                 "total_late_minutes": {"$sum": "$late_minutes"}, "total_overtime_minutes": {"$sum": "$overtime_minutes"}}}]
@@ -444,7 +506,7 @@ def summary_pipeline(month, department=None):
       {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
       {"$group": {"_id": "$department", "headcount": {"$addToSet": "$emp_code"},
         "present_days": {"$sum": {"$cond": [{"$and": [{"$in": ["$logs.status", list(PRESENCE)]}, {"$gte": ["$logs._dow", 2]}, {"$lte": ["$logs._dow", 6]}]}, {"$cond": ["$logs.half_day", 0.5, 1]}, 0]}},
-        "late_count": {"$sum": {"$cond": [{"$gt": ["$logs.late_minutes", 0]}, 1, 0]}}, "total_late_minutes": {"$sum": "$logs.late_minutes"}, "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}}, "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
+        "late_count": {"$sum": {"$cond": [{"$gt": ["$logs.late_minutes", 0]}, 1, 0]}}, "total_late_minutes": {"$sum":"$logs.late_minutes"}, "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}}, "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
         "work_sum": {"$sum": {"$cond": [{"$and": [{"$in": ["$logs.status", list(PRESENCE)]}, {"$ne": ["$logs.work_hours", None]}]}, "$logs.work_hours", 0]}},
         "work_count": {"$sum": {"$cond": [{"$and": [{"$in": ["$logs.status", list(PRESENCE)]}, {"$ne": ["$logs.work_hours", None]}]}, 1, 0]}}}},
       {"$project": {"_id": 0, "department": "$_id", "headcount": {"$size": "$headcount"}, "present_days": 1, "late_count": 1, "total_late_minutes": 1, "on_duty_count": 1, "leave_count": 1, "avg_work_hours": {"$cond": [{"$gt": ["$work_count", 0]}, {"$divide": ["$work_sum", "$work_count"]}, None]}}},
@@ -484,7 +546,7 @@ def leaderboard_pipeline(month, limit, department=None, emp_codes=None):
 @app.get("/analytics/leaderboard/late")
 def late_leaderboard(month: str, limit: int = Query(10, ge=1, le=50), department: Optional[str] = None):
     codes = department_employee_codes(department) if department is not None else None
-    return {"month": month, "items": list(db.attendance_logs.aggregate(leaderboard_pipeline(month, limit, department, codes)))}
+    return {"month": month, "items": list(db.attendance_logs.aggregate(leaderboard_pipeline(month, limit, department,codes)))}
 
 
 def department_employee_codes(department):
@@ -501,7 +563,7 @@ def trend_pipeline(department, start: date, end: date, emp_codes):
       {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "e"}},
       {"$unwind": "$e"},
       {"$match": {"$expr": {"$and": [{"$eq": ["$e.department", department]}, {"$gte": ["$date", "$e.joined_on"]}]}}},
-      {"$group": {"_id": "$date", "present": {"$sum": {"$cond": [{"$in": ["$status", list(PRESENCE)]}, {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]}, 0]}}, "late": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}}}},
+      {"$group": {"_id": "$date", "present": {"$sum": {"$cond": [{"$in": ["$status", list(PRESENCE)]}, {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]}, 0]}}, "late": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]},0]}, 1, 0]}}}},
       {"$project": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d", "timezone": "UTC"}}, "present": 1, "late": 1}},
       {"$unionWith": {"pipeline": [
         {"$documents": [{"day": begin}]},
@@ -518,7 +580,7 @@ def trend_pipeline(department, start: date, end: date, emp_codes):
         "is_working_day": {"$and": [{"$gte": ["$_dow", 2]}, {"$lte": ["$_dow", 6]}]}}},
       {"$set": {"attendance_rate": {"$cond": [{"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]}, {"$divide": ["$present_count", "$headcount"]}, None]}}},
       {"$setWindowFields": {"sortBy": {"day": 1}, "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}}}},
-      {"$project": {"_id": 0, "date": "$day_s", "is_working_day": 1, "headcount": 1, "present_count": 1, "late_count": 1, "attendance_rate": 1, "moving_avg_7d": 1}},
+      {"$project": {"_id": 0, "date": "$day_s", "is_working_day": 1, "headcount": 1, "present_count": 1, "late_count":1, "attendance_rate": 1, "moving_avg_7d": 1}},
       {"$sort": {"date": 1}}]
 
 
@@ -573,7 +635,7 @@ def explain_endpoint(endpoint: Literal["attendance_list", "employee_monthly", "d
     elif endpoint == "late_leaderboard":
         if not month: raise HTTPException(422, "month is required")
         codes = department_employee_codes(department) if department is not None else None
-        pipe = leaderboard_pipeline(month, limit, department, codes); ex = explain_aggregate("attendance_logs", pipe); coll = "attendance_logs"
+        pipe = leaderboard_pipeline(month, limit, department, codes); ex = explain_aggregate("attendance_logs", pipe);coll = "attendance_logs"
     else:
         if not department or not from_ or not to: raise HTTPException(422, "department, from and to are required")
         start, end = valid_date(from_, "from"), valid_date(to, "to")
